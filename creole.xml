@@ -1,0 +1,25 @@
+<!-- creole.xml JapeEditor -->
+<!--  baton, 24/1/2018 -->
+
+<!--
+This file just references the JAR file that contains the compiled resource.
+Configuration is contained in the @CreoleResource annotation on 
+com.vborovin.japeeditor.JapeEditor.
+-->
+
+<CREOLE-DIRECTORY>
+  <CREOLE>
+    <RESOURCE>
+      <NAME>Jape Editor</NAME>
+      <HELPURL>http://gate.ac.uk/userguide/chap:jape</HELPURL>
+      <CLASS>com.vborovin.japeeditor.JapeEditor</CLASS>
+      <JAR>JapeEditor.jar</JAR>
+      <JAR>rsyntaxtextarea.jar</JAR>
+	    <JAR>autocomplete.jar</JAR>
+      <JAR>rstalanguagesupport.jar</JAR>
+      <TOOL/>
+      <AUTOINSTANCE>
+      </AUTOINSTANCE>
+    </RESOURCE>
+  </CREOLE>
+</CREOLE-DIRECTORY>

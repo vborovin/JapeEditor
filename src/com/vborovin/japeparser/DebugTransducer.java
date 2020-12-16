@@ -1,0 +1,1247 @@
+package com.vborovin.japeparser;
+
+import com.vborovin.japeparser.debuglog.DebugLog;
+import gate.*;
+import gate.annotation.AnnotationSetImpl;
+import gate.corpora.DocumentContentImpl;
+import gate.creole.ExecutionException;
+import gate.creole.ExecutionInterruptedException;
+import gate.creole.ResourceInstantiationException;
+import gate.creole.ontology.Ontology;
+import gate.creole.tokeniser.DefaultTokeniser;
+import gate.creole.tokeniser.SimpleTokeniser;
+import gate.fsm.*;
+import gate.jape.*;
+import gate.jape.parser.ParseException;
+import gate.util.*;
+
+import java.util.*;
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class DebugTransducer extends SinglePhaseTransducer {
+
+    private DefaultTokeniser tokeniser;
+    private DebugLog log;
+
+    private static String annotationSetName = "debuggerAnnotationSet";
+    private static String tokeniserSetName = "tokeniserAnnotationSet";
+
+    public DebugTransducer(String s) {
+        super(s);
+        this.name = s;
+        rules = new PrioritisedRuleList();
+        finishedAlready = false;
+        actionContext = new DefaultActionContext();
+
+        FeatureMap params = Factory.newFeatureMap();
+        FeatureMap features = Factory.newFeatureMap();
+        Gate.setHiddenAttribute(features, true);
+        try {
+            tokeniser = (DefaultTokeniser)Factory.createResource(
+                    "gate.creole.tokeniser.DefaultTokeniser",
+                    params, features);
+            tokeniser.setName("Tokeniser " + System.currentTimeMillis());
+        } catch (ResourceInstantiationException e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void finish(GateClassLoader classLoader) {
+        // both MPT and SPT have finish called on them by the parser...
+        if(finishedAlready) return;
+        finishedAlready = true;
+
+        // each rule has a RHS which has a string for java code
+        // those strings need to be compiled now
+
+        // TODO: (JP) if we have some binary JAPE grammars loaded and then we
+        // compile additional action classes here, we can potentially
+        // get duplicate class names.
+        // Instead, we should modify and increment the classname until
+        // we find one that is not already taken.
+        Map<String,String> actionClasses = new HashMap<String,String>(rules.size());
+        for(Iterator<Rule> i = rules.iterator(); i.hasNext();) {
+            Rule rule = i.next();
+            rule.finish(classLoader);
+            actionClasses.put(rule.getRHS().getActionClassName(), rule.getRHS()
+                    .getActionClassString());
+        }
+        try {
+            gate.util.Javac.loadClasses(actionClasses, classLoader);
+        }
+        catch(Exception e) {
+            throw new GateRuntimeException(e);
+        }
+        compileEventBlocksActionClass(classLoader);
+
+        // build the finite state machine transition graph
+        fsm = createFSM();
+        // clear the old style data structures
+        rules.clear();
+        rules = null;
+    } // finish
+
+    private AnnotationSet executeTokeniser(Document doc) throws JapeException, ExecutionException, ResourceInstantiationException {
+        FeatureMap params = Factory.newFeatureMap();
+        params.put(SimpleTokeniser.SIMP_TOK_DOCUMENT_PARAMETER_NAME, doc);
+        params.put(SimpleTokeniser.SIMP_TOK_ANNOT_SET_PARAMETER_NAME, tokeniserSetName);
+
+        tokeniser.setParameterValues(params);
+        tokeniser.setDocument(doc);
+        tokeniser.execute();
+
+        return doc.getAnnotations(tokeniserSetName);
+    }
+
+    public void transduce(Document doc) throws JapeException, ExecutionException, ResourceInstantiationException, ParseException {
+        AnnotationSet inputAS = doc.getAnnotations();
+        AnnotationSet outputAS = new AnnotationSetImpl(doc, annotationSetName);
+
+        SimpleSortedSet offsets = new SimpleSortedSet();
+        SimpleSortedSet annotationsByOffset = offsets;
+
+        // select only the annotations of types specified in the input list
+        if(input.isEmpty()) {
+            addAnnotationsByOffset(offsets, inputAS);
+        }
+        else {
+            Iterator<String> typesIter = input.iterator();
+            AnnotationSet ofOneType = null;
+            while(typesIter.hasNext()) {
+                ofOneType = inputAS.get(typesIter.next());
+                if(ofOneType != null) {
+                    addAnnotationsByOffset(offsets, ofOneType);
+                }
+            }
+        }
+
+        if(annotationsByOffset.isEmpty()) {
+
+            return;
+        }
+
+        annotationsByOffset.sort();
+        // define data structures
+        // FSM instances that haven't blocked yet
+        if(activeFSMInstances == null) {
+            activeFSMInstances = new LinkedList<FSMInstance>();
+        }
+        else {
+            activeFSMInstances.clear();
+        }
+
+        // FSM instances that have reached a final state
+        // This is a list and the contained objects are sorted by the length
+        // of the document content covered by the matched annotations
+        List<FSMInstance> acceptingFSMInstances = new LinkedList<FSMInstance>();
+
+        // find the first node of the document
+        @SuppressWarnings("unchecked")
+        Node startNode = ((List<Annotation>)annotationsByOffset.get(offsets
+                .first())).get(0).getStartNode();
+
+        // used to calculate the percentage of processing done
+        long lastNodeOff = doc.getContent().size().longValue();
+
+        // the offset of the node where the matching currently starts
+        // the value -1 marks no more annotations to parse
+        long startNodeOff = startNode.getOffset().longValue();
+
+        // The structure that fireRule() will update
+        SearchState state = new SearchState(startNode, startNodeOff, 0);
+
+        // the big while for the actual parsing
+        while(state.startNodeOff != -1) {
+            // while there are more annotations to parse
+            // create initial active FSM instance starting parsing from new
+            // startNode
+            // currentFSM = FSMInstance.getNewInstance(
+            FSMInstance firstCurrentFSM = new FSMInstance(fsm,
+                    fsm.getInitialState(),// fresh start
+                    state.startNode,// the matching starts form the current startNode
+                    state.startNode,// current position in AG is the start position
+                    new java.util.HashMap<String, AnnotationSet>(),// no bindings yet!
+                    doc);
+
+            // at this point ActiveFSMInstances should always be empty!
+            activeFSMInstances.clear();
+            acceptingFSMInstances.clear();
+            activeFSMInstances.add(firstCurrentFSM);
+
+            // far each active FSM Instance, try to advance
+            // while(!finished){
+            /*activeFSMWhile: while(!activeFSMInstances.isEmpty()) {
+                if(interrupted)
+                    throw new ExecutionInterruptedException("The execution of the \""
+                            + getName()
+                            + "\" Jape transducer has been abruptly interrupted!");
+
+                // take the first active FSM instance
+                FSMInstance currentFSM = activeFSMInstances.remove(0);
+                FSMMatcherResult result = attemptAdvance(currentFSM, offsets,
+                        annotationsByOffset, doc, inputAS);
+                if(result != null){
+                    if(result.acceptingFSMInstances != null &&
+                            !result.acceptingFSMInstances.isEmpty()) {
+                        acceptingFSMInstances.addAll(result.acceptingFSMInstances);
+                        if(ruleApplicationStyle == FIRST_STYLE ||
+                                ruleApplicationStyle == ONCE_STYLE) break activeFSMWhile;
+                    }
+
+                    if(result.activeFSMInstances != null &&
+                            !result.activeFSMInstances.isEmpty()) {
+                        activeFSMInstances.addAll(result.activeFSMInstances);
+                    }
+                }
+            }*/
+
+            //System.out.println(acceptingFSMInstances);
+            attemptAdvance(firstCurrentFSM, acceptingFSMInstances, offsets,
+                    annotationsByOffset, doc, inputAS);
+
+            boolean keepGoing = fireRule(acceptingFSMInstances, state, lastNodeOff,
+                    offsets, inputAS, outputAS, doc, annotationsByOffset);
+            if(!keepGoing) break;
+            if(((DefaultActionContext)actionContext).isPhaseEnded()) {
+                ((DefaultActionContext)actionContext).setPhaseEnded(false);
+                //TODO:log.debug("Ending phase prematurely");
+                break;
+            }
+        }// while(state.startNodeOff != -1)
+
+        System.out.println(outputAS);
+    }
+
+    @Override
+    public void transduce(Document doc, AnnotationSet inputAS,
+                          AnnotationSet outputAS) throws JapeException, ExecutionException {
+        try {
+            transduce(doc);
+        } catch (ResourceInstantiationException e) {
+            e.printStackTrace();
+        } catch (ParseException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private static AtomicInteger actionClassNumber = new AtomicInteger();
+
+    /** Type of rule application (constants defined in JapeConstants). */
+    protected int ruleApplicationStyle = BRILL_STYLE;
+
+    /** Set the type of rule application (types defined in JapeConstants). */
+    public void setRuleApplicationStyle(int style) {
+        ruleApplicationStyle = style;
+    }
+
+    /**
+     * The list of rules in this transducer. Ordered by priority and
+     * addition sequence (which will be file position if they come from a
+     * file).
+     */
+    protected PrioritisedRuleList rules;
+
+    protected FSM fsm;
+
+    /**
+     * A list of FSM instances that haven't blocked yet, used during matching.
+     */
+    protected List<FSMInstance> activeFSMInstances;
+
+    public FSM getFSM() {
+        return fsm;
+    }
+
+    /** Add a rule. */
+    public void addRule(Rule rule) {
+        rules.add(rule);
+    } // addRule
+
+    /** The values of any option settings given. */
+    private Map<String, String> optionSettings = new HashMap<String, String>();
+
+    /**
+     * Add an option setting. If this option is set already, the new value
+     * overwrites the previous one.
+     */
+    public void setOption(String name, String setting) {
+        optionSettings.put(name, setting);
+    } // setOption
+
+    /** Get the value for a particular option. */
+    public String getOption(String name) {
+        return optionSettings.get(name);
+    } // getOption
+
+    /** Whether the finish method has been called or not. */
+    protected boolean finishedAlready;
+
+    protected FSM createFSM() {
+        return new FSM(this);
+    }
+
+    private void addAnnotationsByOffset(SimpleSortedSet keys,
+                                                      Set<Annotation> annotations) {
+        Iterator<Annotation> annIter = annotations.iterator();
+        while(annIter.hasNext()) {
+            Annotation ann = annIter.next();
+            // ignore empty annotations
+            long offset = ann.getStartNode().getOffset().longValue();
+            if(offset == ann.getEndNode().getOffset().longValue()) continue;
+            keys.add(offset, ann);
+        }
+    }// private void addAnnotationsByOffset()
+
+    private boolean attemptAdvance(FSMInstance currentInstance, List<FSMInstance> acceptingInstances,
+                                   SimpleSortedSet offsets, SimpleSortedSet annotationsByOffset,
+                                   Document document, AnnotationSet inputAS) {
+
+        //BlockBegin();
+
+        String content = ((DocumentContentImpl) document.getContent()).getOriginalContent();
+
+        long startTime = 0;
+        if (Benchmark.isBenchmarkingEnabled()) {
+            startTime = Benchmark.startPoint();
+        }
+
+        // Attempt advancing the current instance.
+        // While doing that, generate new active FSM instances and
+        // new accepting FSM instances, as required
+
+        // create a clone to be used for creating new states
+        // the actual current instance cannot be used itself, as it may change
+        FSMInstance currentClone = (FSMInstance)currentInstance.clone();
+
+        // process the current FSM instance
+        if(currentInstance.getFSMPosition().isFinal()) {
+            // the current FSM is in a final state
+            if(acceptingInstances == null){
+                acceptingInstances = new ArrayList<FSMInstance>();
+            }
+//        newAcceptingInstances.add((FSMInstance)currentInstance.clone());
+            acceptingInstances.add(currentClone);
+            /*final int[] begin = {-1};
+            final int[] end = {1};
+            final int[] index = {0};
+            currentClone.getBindings().values().forEach(annotations -> {
+                annotations.forEach(annotation -> {
+                    int min = Math.toIntExact(annotation.getStartNode().getOffset());
+                    if (index[0] == 0 && begin[0] > min) {
+                        begin[0] = min;
+                    }
+                    int max = Math.toIntExact(annotation.getEndNode().getOffset());
+                    if (end[0] < max) {
+                        end[0] = max;
+                    }
+                    index[0]++;
+                });
+            });*/
+            log.append("{{{Found}}}", -1, 0, 0);
+            // if we're only looking for the shortest stop here
+            if(ruleApplicationStyle == FIRST_STYLE ||
+                    ruleApplicationStyle == ONCE_STYLE ) {
+                if (Benchmark.isBenchmarkingEnabled()) {
+                    updateRuleTime(currentInstance, startTime);
+                }
+                log.appendBlockEnd();
+                return false;
+            }
+        }
+
+        // get all the annotations that start where the current FSM
+        // finishes
+        SimpleSortedSet offsetsTailSet = offsets.tailSet(currentInstance
+                .getAGPosition().getOffset().longValue());
+        long theFirst = offsetsTailSet.first();
+        List<Annotation> paths = (theFirst >= 0 ) ?
+                (List<Annotation>)annotationsByOffset.get(theFirst) : null;
+
+        if(paths != null && !paths.isEmpty()) {
+            for (Annotation path : paths) {
+                String type = path.getType();
+                int annotBegin = Math.toIntExact(path.getStartNode().getOffset());
+                int annotEnd = Math.toIntExact(path.getEndNode().getOffset());
+                String substring = content.substring(annotBegin, annotEnd);
+                String text = "Annotation: \"" + substring + "\", type: " + type + ", offset: " + annotBegin + ", length: " + (annotEnd - annotBegin) + ", features: " + path.getFeatures();
+                if (paths.indexOf(path) == paths.size() - 1) {
+                    log.appendBlockBegin(text, annotBegin, annotEnd - annotBegin, 0);
+                } else {
+                    log.append(text, annotBegin, annotEnd - annotBegin, 0);
+                }
+            }
+
+            // get the transitions for the current state of the FSM
+            State currentState = currentClone.getFSMPosition();
+            Iterator<Transition> transitionsIter = currentState.getTransitions().iterator();
+
+            // A flag used to indicate when advancing the current instance requires
+            // the creation of a clone (i.e. when there are more than 1 ways to advance).
+            boolean newInstanceRequired = false;
+
+            boolean hasFound = false;
+
+            // for each transition, keep the set of annotations starting at
+            // current node (the "paths") that match each constraint of the
+            // transition.
+            transitionsWhile: while(transitionsIter.hasNext()) {
+                Transition currentTransition = transitionsIter.next();
+
+                // There will only be multiple constraints if this transition is
+                // over
+                // a written constraint that has the "and" operator (comma) and
+                // the
+                // parts referr to different annotation types. For example -
+                // {A,B} would result in 2 constraints in the array, while
+                // {A.foo=="val", A.bar=="val"} would only be a single
+                // constraint.
+                Constraint[] currentConstraints = currentTransition.getConstraints()
+                        .getConstraints();
+
+                boolean hasPositiveConstraint = false;
+                @SuppressWarnings("rawtypes")
+                List<Annotation>[] matchesByConstraint = new List[currentConstraints.length];
+                for(int i = 0; i < matchesByConstraint.length; i++)
+                    matchesByConstraint[i] = null;
+                // Map<Constraint, Collection<Annotation>> matchingMap =
+                // new LinkedHashMap<Constraint, Collection<Annotation>>();
+
+                // check all negated constraints first. If any annotation
+                // matches any
+                // negated constraint, then the transition fails.
+                for(int i = 0; i < currentConstraints.length; i++) {
+                    // for(Constraint c : currentConstraints) {
+                    Constraint c = currentConstraints[i];
+                    if (!hasFound) {
+                        log.append(c.getDisplayString(""), -1, 0, 1);
+                    }
+                    if(!c.isNegated()) {
+                        hasPositiveConstraint = true;
+                        continue;
+                    }
+                    List<Annotation> matchList = c.matches(paths, ontology, inputAS);
+                    if(!matchList.isEmpty()) continue transitionsWhile;
+                }
+
+                // Now check all non-negated constraints. At least one
+                // annotation must
+                // match each constraint.
+                if(hasPositiveConstraint) {
+                    for(int i = 0; i < currentConstraints.length; i++) {
+                        // for(Constraint c : currentConstraints) {
+                        Constraint c = currentConstraints[i];
+                        if(c.isNegated()) continue;
+                        List<Annotation> matchList = c.matches(paths, ontology, inputAS);
+                        // if no annotations matched, then the transition fails.
+                        if(matchList.isEmpty()) {
+                            continue transitionsWhile;
+                        }
+                        else {
+                            // matchingMap.put(c, matchList);
+                            matchesByConstraint[i] = matchList;
+                        }
+                    }
+                } // end if hasPositiveConstraint
+                else {
+                    // There are no non-negated constraints. Since the negated
+                    // constraints
+                    // did not fail, this means that all of the current
+                    // annotations
+                    // are potentially valid. Add the whole set to the
+                    // matchingMap.
+                    // Use the first negated constraint for the debug trace since
+                    // any will do.
+                    // matchingMap.put(currentConstraints[0], paths);
+                    matchesByConstraint[0] = paths;
+                }
+
+                // We have a match if every positive constraint is met by at
+                // least one annot.
+                // Given the sets Sx of the annotations that match constraint x,
+                // compute all tuples (A1, A2, ..., An) where Ax comes from the
+                // set Sx and n is the number of constraints
+                List<List<Annotation>> matchLists = new ArrayList<List<Annotation>>();
+                for(int i = 0; i < currentConstraints.length; i++) {
+                    // for(Map.Entry<Constraint,Collection<Annotation>> entry :
+                    // matchingMap.entrySet()) {
+                    // seeing the constraint is useful when debugging
+                    @SuppressWarnings("unused")
+                    Constraint c = currentConstraints[i];
+                    // Constraint c = entry.getKey();
+                    List<Annotation> matchList = matchesByConstraint[i];
+                    // Collection<Annotation> matchList = entry.getValue();
+                    if(matchList != null) {
+                        matchLists.add(matchList);
+                    }
+                    // if (matchList instanceof List)
+                    // matchLists.add((List<Annotation>)matchList);
+                    // else
+                    // matchLists.add(new ArrayList<Annotation>(matchList));
+                }
+
+                /*FSM graph = currentInstance.getSupportGraph();
+                for (Map.Entry<State, SimpleArraySet<Transition>> entry : graph.getAllStates().entrySet()) {
+                    RightHandSide rhs = entry.getKey().getAction();
+                    Iterator<Transition> transitionIterator = entry.getValue().iterator();
+                    while (transitionIterator.hasNext()) {
+                        Transition transition = transitionIterator.next();
+                        //log.append(String.valueOf(currentTransition.compareTo(transition)), -1, 0);
+                        if (currentTransition.compareTo(transition) == 0 && rhs != null) {
+                            log.append(rhs.getRuleName(), -1, 0);
+                        }
+                    }
+                }*/
+
+                if (!hasFound && matchLists.size() > 0) {
+                    //log.append("FOUND", -1, 0);
+                    hasFound = true;
+                }
+
+                List<List<Annotation>> combinations = combine(matchLists, matchLists
+                        .size(), new LinkedList<Annotation>());
+                // Create a new FSM for every tuple of annot
+
+                for(List<Annotation> tuple : combinations) {
+                    // Find longest annotation and use that to mark the start of
+                    // the
+                    // new FSM
+                    Annotation matchingAnnot = getRightMostAnnotation(tuple);
+
+                    // we have a match.
+                    FSMInstance newFSMI;
+                    // create a new FSMInstance, advance it over
+                    // the current
+                    // annotation take care of the bindings and add it to
+                    // ActiveFSM
+                    if(newInstanceRequired){
+                        // we need to create a clone
+                        newFSMI = (FSMInstance)currentClone.clone();
+                        //set the old AG state
+                        //set the old FSM position
+                    }else{
+                        // we're advancing the current instance
+                        newFSMI = currentInstance;
+                        // next time, we'll have to create a new one
+                        newInstanceRequired = true;
+                        //save the old FSM position
+                    }
+                    newFSMI.setAGPosition(matchingAnnot.getEndNode());
+                    newFSMI.setFSMPosition(currentTransition.getTarget());
+
+                    // bindings
+                    Map<String,AnnotationSet> binds = newFSMI.getBindings();
+                    Iterator<String> labelsIter = currentTransition.getBindings().iterator();
+                    String oneLabel;
+                    AnnotationSet boundAnnots, newSet;
+                    while(labelsIter.hasNext()) {
+                        oneLabel = labelsIter.next();
+                        boundAnnots = binds.get(oneLabel);
+                        if(boundAnnots != null)
+                            newSet = new AnnotationSetImpl(boundAnnots);
+                        else newSet = new AnnotationSetImpl(document);
+
+                        for(Annotation annot : tuple) {
+                            newSet.add(annot);
+                        }
+
+                        binds.put(oneLabel, newSet);
+                    }// while(labelsIter.hasNext())
+                    boolean doContinue = attemptAdvance(newFSMI, acceptingInstances, offsets, annotationsByOffset, document, inputAS);
+                    if (!doContinue) {
+                        return false;
+                    }
+                } // iter over matching combinations
+            }// while(transitionsIter.hasNext())
+
+            if (!hasFound) {
+                log.append("{{{Not found}}}", -1, 0, 0);
+            }
+            log.appendBlockEnd();
+        }
+        if (Benchmark.isBenchmarkingEnabled()) {
+            updateRuleTime(currentInstance, startTime);
+        }
+        return true;
+    }
+
+    /**
+     * Increment the time spent by the rule associated with the FSM
+     * @param currentInstance  The FSMInstance which has been running since startTime
+     * @param startTime    The time that the FSMInstance started running
+     */
+    private void updateRuleTime(FSMInstance currentInstance, long startTime) {
+        int index = currentInstance.getFSMPosition().getIndexInRuleList();
+        currentInstance.getSupportGraph().getRuleTimes().get(index).addTime(Benchmark.startPoint() - startTime);
+    }
+
+    /**
+     * Return the annotation with the right-most end node
+     */
+    protected Annotation getRightMostAnnotation(Collection<Annotation> annots) {
+        long maxOffset = -1;
+        Annotation retVal = null;
+        for(Annotation annot : annots) {
+            Long curOffset = annot.getEndNode().getOffset();
+            if(curOffset > maxOffset) {
+                maxOffset = curOffset;
+                retVal = annot;
+            }
+        }
+
+        return retVal;
+    }
+
+    /**
+     * Computes all tuples (x1, x2, ..., xn) resulting from the linear
+     * combination of the elements of n lists, where x1 comes from the 1st
+     * list, x2 comes from the second, etc. This method works recursively.
+     * The first call should have those parameters:
+     *
+     * @param sourceLists an array of n lists whose elements will be
+     *          combined
+     * @param maxTupleSize the number of elements per tuple
+     * @param incompleteTuple an empty list
+     */
+
+    private static List<List<Annotation>> combine(List<List<Annotation>> sourceLists,
+                                                  int maxTupleSize, List<Annotation> incompleteTuple) {
+
+        List<List<Annotation>> newTupleList = new LinkedList<List<Annotation>>();
+
+        if(incompleteTuple.size() == maxTupleSize) {
+            newTupleList.add(incompleteTuple);
+        }
+        else {
+            List<Annotation> currentSourceList = sourceLists.get(incompleteTuple.size());
+            // use for loop instead of ListIterator to increase speed
+            // (critical here)
+            for(int i = 0; i < currentSourceList.size(); i++) {
+                List<Annotation> augmentedTuple = new LinkedList<Annotation>(incompleteTuple);
+                augmentedTuple.add(currentSourceList.get(i));
+                newTupleList.addAll(combine(sourceLists, maxTupleSize, augmentedTuple));
+            }
+        }
+
+        return newTupleList;
+    }
+
+    /**
+     * Fire the rule that matched.
+     *
+     * @return true if processing should keep going, false otherwise.
+     */
+
+    @SuppressWarnings("unchecked")
+    protected boolean fireRule(List<FSMInstance> acceptingFSMInstances,
+                               SearchState state, long lastNodeOff, SimpleSortedSet offsets,
+                               AnnotationSet inputAS, AnnotationSet outputAS, Document doc,
+                               SimpleSortedSet annotationsByOffset) throws JapeException,
+            ExecutionException {
+
+        Node startNode = state.startNode;
+        long startNodeOff = state.startNodeOff;
+        long oldStartNodeOff = state.oldStartNodeOff;
+
+        // FIRE THE RULE
+        long lastAGPosition = -1;
+        if(acceptingFSMInstances.isEmpty()) {
+            // no rule to fire, advance to the next input offset
+            lastAGPosition = startNodeOff + 1;
+        }
+        else if(ruleApplicationStyle == BRILL_STYLE
+                || ruleApplicationStyle == ALL_STYLE) {
+            // fire the rules corresponding to all accepting FSM instances
+            Iterator<FSMInstance> accFSMIter = acceptingFSMInstances.iterator();
+            FSMInstance currentAcceptor;
+            RightHandSide currentRHS;
+            lastAGPosition = startNode.getOffset().longValue();
+
+            while(accFSMIter.hasNext()) {
+                currentAcceptor = accFSMIter.next();
+                currentRHS = currentAcceptor.getFSMPosition().getAction();
+
+                currentRHS.transduce(doc, currentAcceptor.getBindings(), inputAS,
+                        outputAS, ontology, actionContext);
+
+                if(ruleApplicationStyle == BRILL_STYLE) {
+                    // find the maximal next position
+                    long currentAGPosition = currentAcceptor.getAGPosition().getOffset()
+                            .longValue();
+                    if(currentAGPosition > lastAGPosition)
+                        lastAGPosition = currentAGPosition;
+                }
+            }
+            if(ruleApplicationStyle == ALL_STYLE) {
+                // simply advance to next offset
+                lastAGPosition = lastAGPosition + 1;
+            }
+
+        }
+        else if(ruleApplicationStyle == APPELT_STYLE
+                || ruleApplicationStyle == FIRST_STYLE
+                || ruleApplicationStyle == ONCE_STYLE) {
+
+            // AcceptingFSMInstances is an ordered structure:
+            // just execute the longest (last) rule
+            Collections.sort(acceptingFSMInstances, Collections.reverseOrder());
+            Iterator<FSMInstance> accFSMIter = acceptingFSMInstances.iterator();
+            FSMInstance currentAcceptor = accFSMIter.next();
+            if(isDebugMode()) {
+                // see if we have any conflicts
+                Iterator<FSMInstance> accIter = acceptingFSMInstances.iterator();
+                FSMInstance anAcceptor;
+                List<FSMInstance> conflicts = new ArrayList<FSMInstance>();
+                while(accIter.hasNext()) {
+                    anAcceptor = accIter.next();
+                    if(anAcceptor.equals(currentAcceptor)) {
+                        conflicts.add(anAcceptor);
+                    }
+                    else {
+                        break;
+                    }
+                }
+                if(conflicts.size() > 1) {
+                    //TODO:log.info("Conflicts found during matching:"
+                    //TODO:+ "\n================================");
+                    accIter = conflicts.iterator();
+                    int i = 0;
+                    while(accIter.hasNext()) {
+                        //TODO:if (log.isInfoEnabled())
+                        //TODO:log.info(i++ + ") " + accIter.next().toString());
+                    }
+                }
+            }
+            RightHandSide currentRHS = currentAcceptor.getFSMPosition().getAction();
+
+            currentRHS.transduce(doc, currentAcceptor.getBindings(), inputAS,
+                    outputAS, ontology, actionContext);
+
+            // if in matchGroup mode check other possible patterns in this
+            // span
+            if(isMatchGroupMode()) {
+                // log.debug("Jape grammar in MULTI application style.");
+                // ~bp: check for other matching fsm instances with same length,
+                // priority and rule index : if such execute them also.
+                String currentAcceptorString = null;
+                multiModeWhile: while(accFSMIter.hasNext()) {
+                    FSMInstance rivalAcceptor = accFSMIter.next();
+                    // get rivals that match the same document segment
+                    // makes use of the semantic difference between the compareTo
+                    // and equals methods on FSMInstance
+                    if(rivalAcceptor.compareTo(currentAcceptor) == 0) {
+                        // gets the rivals that are NOT COMPLETELY IDENTICAL with
+                        // the current acceptor.
+                        if(!rivalAcceptor.equals(currentAcceptor)) {
+                            //depends on the debug option in the transducer
+                            if(isDebugMode()) {
+                                if(currentAcceptorString == null) {
+                                    // first rival
+                                    currentAcceptorString = currentAcceptor.toString();
+                                    //TODO:if (log.isInfoEnabled()) {
+                                    //TODO:log.info("~Jape Grammar Transducer : "
+                                    //TODO:        + "\nConcurrent Patterns by length,priority and index (all transduced):");
+                                    //TODO:log.info(currentAcceptorString);
+                                    //TODO:log.info("bindings : " + currentAcceptor.getBindings());
+                                    //TODO:log.info("Rivals Follow: ");
+                                    //TODO:}
+                                }
+                                //TODO:if (log.isInfoEnabled()) {
+                                //TODO:    log.info(rivalAcceptor);
+                                //TODO:   log.info("bindings : " + rivalAcceptor.getBindings());
+                                //TODO:}
+                            }
+                            // DEBUG
+                            currentRHS = rivalAcceptor.getFSMPosition().getAction();
+
+                            currentRHS.transduce(doc, rivalAcceptor.getBindings(), inputAS,
+                                    outputAS, ontology, actionContext);
+
+                        } // equal rival
+                    }
+                    else {
+                        // if rival is not equal this means that there are no
+                        // further
+                        // equal rivals (since the list is sorted)
+                        break multiModeWhile;
+                    }
+                } // while there are fsm instances
+            } // matchGroupMode
+
+            // if in ONCE mode stop after first match
+            if(ruleApplicationStyle == ONCE_STYLE) {
+                state.startNodeOff = startNodeOff;
+                return false;
+            }
+
+            // advance in AG
+            lastAGPosition = currentAcceptor.getAGPosition().getOffset().longValue();
+        }
+        else throw new RuntimeException("Unknown rule application style!");
+
+        // advance on input
+        SimpleSortedSet offsetsTailSet = offsets.tailSet(lastAGPosition);
+        long theFirst = offsetsTailSet.first();
+        if(theFirst < 0) {
+            // no more input, phew! :)
+            startNodeOff = -1;
+
+        } else {
+            long nextKey = theFirst;
+            startNode = ((List<Annotation>)annotationsByOffset.get(nextKey))
+                    .get(0). // nextKey
+                    getStartNode();
+            startNodeOff = startNode.getOffset().longValue();
+
+            // eliminate the possibility for infinite looping
+            if(oldStartNodeOff == startNodeOff) {
+                // we are about to step twice in the same place, ...skip ahead
+                lastAGPosition = startNodeOff + 1;
+                offsetsTailSet = offsets.tailSet(lastAGPosition);
+                theFirst = offsetsTailSet.first();
+                if(theFirst < 0) {
+                    // no more input, phew! :)
+                    startNodeOff = -1;
+
+                }
+                else {
+                    nextKey = theFirst;
+                    startNode = ((List<Annotation>)annotationsByOffset.get(theFirst))
+                            .get(0).getStartNode();
+                    startNodeOff = startNode.getOffset().longValue();
+                }
+            }// if(oldStartNodeOff == startNodeOff)
+            // fire the progress event
+            if(startNodeOff - oldStartNodeOff > 256) {
+                if(isInterrupted())
+                    throw new ExecutionInterruptedException("The execution of the \""
+                            + getName()
+                            + "\" Jape transducer has been abruptly interrupted!");
+
+                fireProgressChanged((int)(100 * startNodeOff / lastNodeOff));
+                oldStartNodeOff = startNodeOff;
+            }
+        }
+        // by Shafirin Andrey start (according to Vladimir Karasev)
+        // if(gate.Gate.isEnableJapeDebug()) {
+        // if (null != phaseController) {
+        // phaseController.TraceTransit(rulesTrace);
+        // }
+        // }
+        // by Shafirin Andrey end
+
+        state.oldStartNodeOff = oldStartNodeOff;
+        state.startNodeOff = startNodeOff;
+        state.startNode = startNode;
+        return true;
+    } // fireRule
+
+    /** A string representation of this object. */
+    @Override
+    public String toString() {
+        return toString("");
+    } // toString()
+
+    /** A string representation of this object. */
+    @Override
+    public String toString(String pad) {
+        String newline = Strings.getNl();
+        String newPad = Strings.addPadding(pad, INDENT_PADDING);
+
+        StringBuffer buf = new StringBuffer(pad + "SPT: name(" + name
+                + "); ruleApplicationStyle(");
+
+        switch(ruleApplicationStyle) {
+            case APPELT_STYLE:
+                buf.append("APPELT_STYLE); ");
+                break;
+            case BRILL_STYLE:
+                buf.append("BRILL_STYLE); ");
+                break;
+            default:
+                break;
+        }
+
+        buf.append("rules(" + newline);
+        if(rules != null) {
+            Iterator<Rule> rulesIterator = rules.iterator();
+            while(rulesIterator.hasNext())
+                buf.append(rulesIterator.next().toString(newPad) + " ");
+        }
+        buf.append(newline + pad + ")." + newline);
+
+        return buf.toString();
+    } // toString(pad)
+
+    // needed by fsm
+    public PrioritisedRuleList getRules() {
+        return rules;
+    }
+
+    /**
+     * Adds a new type of input annotations used by this transducer. If
+     * the list of input types is empty this transducer will parse all the
+     * annotations in the document otherwise the types not found in the
+     * input list will be completely ignored! To be used with caution!
+     */
+    public void addInput(String ident) {
+        input.add(ident);
+    }
+
+    /**
+     * Checks if this Phase has the annotation type as input. This is the
+     * case if either no input annotation types were specified, in which case
+     * all annotation types will be used, or if the annotation type was
+     * specified.
+     *
+     * @param ident the type of an annotation to be checked
+     * @return true if the annotation type will be used in this phase
+     */
+    public boolean hasInput(String ident) {
+        return input.isEmpty() || input.contains(ident);
+    }
+
+    /**
+     * Check if there is a restriction on the input annotation types
+     * for this SPT, i.e. if there were annotation types specified for
+     * the "Input:" declaration of this phase.
+     *
+     * @return true if only certain annotation types are considered in this
+     *   phase, false if all are considered.
+     */
+    public boolean isInputRestricted() {
+        return !input.isEmpty();
+    }
+
+    /**
+     * Defines the types of input annotations that this transducer reads.
+     * If this set is empty the transducer will read all the annotations
+     * otherwise it will only "see" the annotations of types found in this
+     * list ignoring all other types of annotations.
+     */
+    // by Shafirin Andrey start (modifier changed to public)
+    public Set<String> input = new HashSet<String>();
+
+    public int getRuleApplicationStyle() {
+        return ruleApplicationStyle;
+    }
+
+    private transient SourceInfo sourceInfo = null;
+    private String controllerStartedEventBlock = "";
+    private String controllerFinishedEventBlock = "";
+    private String controllerAbortedEventBlock = "";
+    private String javaImportsBlock = "";
+    private Object controllerEventBlocksActionClass = null;
+    private String controllerEventBlocksActionClassName;
+    private static final String nl = Strings.getNl();
+    private static final String controllerEventBlocksActionClassSourceTemplate =
+            "package %%packagename%%;"+nl+
+                    "import java.io.*;"+nl+
+                    "import java.util.*;"+nl+
+                    "import gate.*;"+nl+
+                    "import gate.jape.*;"+nl+
+                    "import gate.creole.ontology.*;"+nl+
+                    "import gate.annotation.*;"+nl+
+                    "import gate.util.*;"+nl+
+                    "%%javaimports%%"+nl+nl+
+                    "public class %%classname%% implements ControllerEventBlocksAction {"+nl+
+                    "  private Ontology ontology;"+nl+
+                    "  public void setOntology(Ontology o) { ontology = o; }"+nl+
+                    "  public Ontology getOntology() { return ontology; }"+nl+
+                    "  private ActionContext ctx;"+nl+
+                    "  public void setActionContext(ActionContext ac) { ctx = ac; }"+nl+
+                    "  public ActionContext getActionContext() { return ctx; }"+nl+
+                    "  private Controller controller;"+nl+
+                    "  public void setController(Controller c) { controller = c; }"+nl+
+                    "  public Controller getController() { return controller; }"+nl+
+                    "  private Corpus corpus;"+nl+
+                    "  public void setCorpus(Corpus c) { corpus = c; }"+nl+
+                    "  public Corpus getCorpus() { return corpus; }"+nl+
+                    "  private Throwable throwable;"+nl+
+                    "  public void setThrowable(Throwable t) { throwable = t; }"+nl+
+                    "  public Throwable getThrowable() { return throwable; }"+nl+
+                    "  public void controllerExecutionStarted() {"+nl+
+                    "    %%started%%"+nl+
+                    "  }"+nl+
+                    "  public void controllerExecutionFinished() {"+nl+
+                    "    %%finished%%"+nl+
+                    "  }"+nl+
+                    "  public void controllerExecutionAborted() {"+nl+
+                    "    %%aborted%%"+nl+
+                    "  }"+nl+
+                    "}"+nl+
+                    ""+nl;
+
+    public void setControllerEventBlocks(
+            String started,
+            String finished,
+            String aborted,
+            String javaimports) {
+        controllerStartedEventBlock = started;
+        controllerFinishedEventBlock = finished;
+        controllerAbortedEventBlock = aborted;
+        javaImportsBlock = javaimports;
+    }
+
+    public String generateControllerEventBlocksCode(String packageName, String className) {
+        String sourceCode = null;
+        // if any of the three blocks is not null, set the corpusBlockActionClassSource
+        // to the final source code of the class
+        if(controllerStartedEventBlock != null || controllerFinishedEventBlock != null || controllerAbortedEventBlock != null) {
+
+            sourceCode =
+                    controllerEventBlocksActionClassSourceTemplate;
+
+            // if this method is called with a classname, use that (this happens
+            // when we are called from gate.jape.plus.SPTBuilder.buildSPT
+            // If we get null or the empty string as a classname, generate our own
+            String  ceb_classname = className;
+            if(className == null || className.isEmpty()) {
+                boolean neednewclassname = true;
+                while(neednewclassname) {
+                    ceb_classname =  "ControllerEventBlocksActionClass" +
+                            actionClassNumber.getAndIncrement();
+                    controllerEventBlocksActionClassName = packageName + "." + ceb_classname;
+                    try {
+                        Gate.getClassLoader().loadClass(controllerEventBlocksActionClassName);
+                        neednewclassname = true;
+                    } catch (ClassNotFoundException e) {
+                        neednewclassname = false;
+                    }
+                }
+            }
+            sourceCode = sourceCode
+                    .replace("%%classname%%",ceb_classname)
+                    .replace("%%packagename%%", packageName);
+
+
+            sourceInfo = new SourceInfo(controllerEventBlocksActionClassName,name,"controllerEvents");
+
+            sourceCode =
+                    sourceCode.replace("%%javaimports%%",
+                            javaImportsBlock != null ? javaImportsBlock : "// no 'Imports:' block for more imports defined");
+
+            int index = sourceCode.indexOf("%%started%%");
+            String previousCode = sourceCode.substring(0, index).trim();
+            sourceCode =
+                    sourceCode.replace("%%started%%",
+                            controllerStartedEventBlock != null ? sourceInfo.addBlock(previousCode, controllerStartedEventBlock) : "// no code defined");
+
+            index = sourceCode.indexOf("%%finished%%");
+            previousCode = sourceCode.substring(0, index).trim();
+            sourceCode =
+                    sourceCode.replace("%%finished%%",
+                            controllerFinishedEventBlock != null ? sourceInfo.addBlock(previousCode, controllerFinishedEventBlock) : "// no code defined");
+
+            index = sourceCode.indexOf("%%aborted%%");
+            previousCode = sourceCode.substring(0, index).trim();
+            sourceCode =
+                    sourceCode.replace("%%aborted%%",
+                            controllerAbortedEventBlock != null ? sourceInfo.addBlock(previousCode, controllerAbortedEventBlock) : "// no code defined");
+        }
+        return sourceCode;
+    }
+
+    @Override
+    public void runControllerExecutionStartedBlock(
+            ActionContext ac, Controller c, Ontology o) throws ExecutionException {
+        if(controllerEventBlocksActionClass != null) {
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setController(c);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setOntology(o);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setActionContext(ac);
+            if(c instanceof CorpusController) {
+                Corpus corpus = ((CorpusController)c).getCorpus();
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(corpus);
+            } else {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(null);
+            }
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setThrowable(null);
+
+            try {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        controllerExecutionStarted();
+            }
+            catch (Throwable e) {
+                // if the action class throws an exception, re-throw it with a
+                // full description of the problem, inc. stack trace and the RHS
+                // action class code
+                if (sourceInfo != null) sourceInfo.enhanceTheThrowable(e);
+
+                if(e instanceof Error) {
+                    throw (Error)e;
+                }
+                if(e instanceof RuntimeException) {
+                    throw (RuntimeException)e;
+                }
+
+                // shouldn't happen...
+                throw new ExecutionException(
+                        "Couldn't run controller started action", e);
+            }
+        }
+    }
+
+    @Override
+    public void runControllerExecutionFinishedBlock(
+            ActionContext ac, Controller c, Ontology o) throws ExecutionException {
+        if(controllerEventBlocksActionClass != null) {
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setController(c);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setOntology(o);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setActionContext(ac);
+            if(c instanceof CorpusController) {
+                Corpus corpus = ((CorpusController)c).getCorpus();
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(corpus);
+            } else {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(null);
+            }
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setThrowable(null);
+
+            try {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        controllerExecutionFinished();
+            }
+            catch (Throwable e) {
+                // if the action class throws an exception, re-throw it with a
+                // full description of the problem, inc. stack trace and the RHS
+                // action class code
+                if (sourceInfo != null) sourceInfo.enhanceTheThrowable(e);
+
+                if(e instanceof Error) {
+                    throw (Error)e;
+                }
+                if(e instanceof RuntimeException) {
+                    throw (RuntimeException)e;
+                }
+
+                // shouldn't happen...
+                throw new ExecutionException(
+                        "Couldn't run controller finished action", e);
+            }
+        }
+    }
+
+    @Override
+    public void runControllerExecutionAbortedBlock(
+            ActionContext ac, Controller c, Throwable t, Ontology o) throws ExecutionException {
+        if(controllerEventBlocksActionClass != null) {
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setController(c);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setOntology(o);
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setActionContext(ac);
+            if(c instanceof CorpusController) {
+                Corpus corpus = ((CorpusController)c).getCorpus();
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(corpus);
+            } else {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        setCorpus(null);
+            }
+            ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                    setThrowable(t);
+
+            try {
+                ((ControllerEventBlocksAction) controllerEventBlocksActionClass).
+                        controllerExecutionAborted();
+            }
+            catch (Throwable e) {
+                // if the action class throws an exception, re-throw it with a
+                // full description of the problem, inc. stack trace and the RHS
+                // action class code
+                if (sourceInfo != null) sourceInfo.enhanceTheThrowable(e);
+
+                if(e instanceof Error) {
+                    throw (Error)e;
+                }
+                if(e instanceof RuntimeException) {
+                    throw (RuntimeException)e;
+                }
+
+                // shouldn't happen...
+                throw new ExecutionException(
+                        "Couldn't run controller aborted action", e);
+            }
+        }
+    }
+
+    private void compileEventBlocksActionClass(GateClassLoader classloader) {
+        String sourceCode = generateControllerEventBlocksCode("japeactionclasses","");
+        if(sourceCode != null) {
+            Map<String,String> actionClasses = new HashMap<String,String>(1);
+            actionClasses.put(controllerEventBlocksActionClassName,
+                    sourceCode);
+            try {
+                gate.util.Javac.loadClasses(actionClasses, classloader);
+                controllerEventBlocksActionClass =
+                        classloader.
+                                loadClass(controllerEventBlocksActionClassName).newInstance();
+            }catch(Exception e1){
+                throw new GateRuntimeException(e1);
+            }
+        }
+    }
+
+    /**
+     * This returns any compiled controller event blocks action class that
+     * may exist at the time of calling or null. This is mainly needed for
+     * alternate implementations of JAPE that are based on the core JAPE
+     * classes and want to support controller event blocks too.
+     *
+     * @return an object that represents the compiled event blocks or null
+     */
+    public ControllerEventBlocksAction getControllerEventBlocksActionClass() {
+        return (ControllerEventBlocksAction)controllerEventBlocksActionClass;
+    }
+
+    public void setLog(DebugLog log) {
+        this.log = log;
+    }
+
+    /*
+     * A structure to pass information to/from the fireRule() method.
+     * Since Java won't let us return multiple values, we stuff them into
+     * a 'state' object that fireRule() can update.
+     */
+    protected static class SearchState {
+        Node startNode;
+
+        long startNodeOff;
+
+        long oldStartNodeOff;
+
+        SearchState(Node startNode, long startNodeOff, long oldStartNodeOff) {
+            this.startNode = startNode;
+            this.startNodeOff = startNodeOff;
+            this.oldStartNodeOff = oldStartNodeOff;
+        }
+    }
+
+    private static final class FSMMatcherResult{
+        /**
+         * @param activeFSMInstances
+         * @param acceptingFSMInstances
+         */
+        public FSMMatcherResult(List<FSMInstance> activeFSMInstances,
+                                List<FSMInstance> acceptingFSMInstances) {
+            this.activeFSMInstances = activeFSMInstances;
+            this.acceptingFSMInstances = acceptingFSMInstances;
+        }
+
+        private List<FSMInstance> acceptingFSMInstances;
+        private List<FSMInstance> activeFSMInstances;
+
+    }
+}
