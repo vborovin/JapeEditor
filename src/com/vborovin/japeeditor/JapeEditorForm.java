@@ -94,8 +94,8 @@ public class JapeEditorForm extends JFrame {
         JapeLanguageSupport.addJapeLanguageSupport();
 
         AbstractTokenMakerFactory atmf = (AbstractTokenMakerFactory) TokenMakerFactory.getDefaultInstance();
-        atmf.putMapping("text/JAPE", "com.naradius.japetoken.JapeTokenMaker");
-        atmf.putMapping("text/JAPEDebugger", "com.naradius.japetoken.DebuggerTokenMaker");
+        atmf.putMapping("text/JAPE", "com.vborovin.japetoken.JapeTokenMaker");
+        atmf.putMapping("text/JAPEDebugger", "com.vborovin.japetoken.DebuggerTokenMaker");
 
         FoldParserManager.get().addFoldParserMapping("text/JAPE", new JapeFoldParser());
         FoldParserManager.get().addFoldParserMapping("text/JAPEDebugger", new DebugFoldParser());

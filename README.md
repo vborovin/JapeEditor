@@ -1,7 +1,7 @@
 ## JAPE Editor
 Source code editor for JAPE language. Works as GATE Developer plugin.
 
-Uses a fork of [RSyntaxTextArea](https://github.com/Naradius/RSyntaxTextArea).
+Uses a fork of [RSyntaxTextArea](https://github.com/vborovin/RSyntaxTextArea).
 
 ![Jape Editor](https://i.imgur.com/FntYEDJ.png)
 

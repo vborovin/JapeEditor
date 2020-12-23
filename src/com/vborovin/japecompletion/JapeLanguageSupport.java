@@ -18,7 +18,7 @@ public class JapeLanguageSupport extends AbstractLanguageSupport {
 
     public static void addJapeLanguageSupport() {
         LanguageSupportFactory lsf = LanguageSupportFactory.get();
-        lsf.addLanguageSupport("text/JAPE", "com.naradius.japecompletion.JapeLanguageSupport");
+        lsf.addLanguageSupport("text/JAPE", "com.vborovin.japecompletion.JapeLanguageSupport");
     }
 
     @Override
